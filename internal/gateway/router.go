@@ -49,6 +49,7 @@ type EventRouter struct {
 	logger *audit.Logger
 	policy *enforce.PolicyEngine
 	otel   *telemetry.Provider
+	judge  *LLMJudge
 
 	autoApprove     bool
 	activeToolSpans map[string][]*activeSpan
@@ -66,6 +67,11 @@ func NewEventRouter(client *Client, store *audit.Store, logger *audit.Logger, au
 		autoApprove:     autoApprove,
 		activeToolSpans: make(map[string][]*activeSpan),
 	}
+}
+
+// SetJudge configures the LLM judge for tool call injection detection.
+func (r *EventRouter) SetJudge(j *LLMJudge) {
+	r.judge = j
 }
 
 // Route dispatches a single event frame to the correct handler.
@@ -565,6 +571,23 @@ func (r *EventRouter) handleToolCall(evt EventFrame) {
 			fmt.Sprintf("reason=%s severity=%s confidence=%.2f",
 				findings[0].RuleID, findings[0].Severity, findings[0].Confidence))
 		fmt.Fprintf(os.Stderr, "[sidecar] FLAGGED tool call: %s (%s)\n", payload.Tool, findings[0].Title)
+	}
+
+	// LLM judge — runs tool injection detection on arguments (async).
+	if r.judge != nil && len(payload.Args) > 0 {
+		go func(tool string, args json.RawMessage) {
+			verdict := r.judge.RunToolJudge(context.Background(), tool, string(args))
+			if verdict.Severity != "NONE" {
+				fmt.Fprintf(os.Stderr, "[sidecar] LLM JUDGE flagged tool call: %s severity=%s %s\n",
+					tool, verdict.Severity, verdict.Reason)
+				_ = r.logger.LogAction("gateway-tool-call-judge-flagged", tool,
+					fmt.Sprintf("severity=%s findings=%d reason=%s",
+						verdict.Severity, len(verdict.Findings), verdict.Reason))
+				if r.otel != nil {
+					r.otel.RecordInspectEvaluation(context.Background(), tool, verdict.Action, verdict.Severity)
+				}
+			}
+		}(payload.Tool, payload.Args)
 	}
 
 	if r.otel != nil {

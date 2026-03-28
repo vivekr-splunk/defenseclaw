@@ -59,6 +59,18 @@ func NewSidecar(cfg *config.Config, store *audit.Store, logger *audit.Logger, sh
 	fmt.Fprintf(os.Stderr, "[sidecar] device identity loaded (id=%s)\n", client.device.DeviceID)
 
 	router := NewEventRouter(client, store, logger, cfg.Gateway.AutoApprove, otel)
+
+	// Wire LLM judge for tool call injection detection if configured.
+	if cfg.Guardrail.Judge.Enabled && cfg.Guardrail.Judge.ToolInjection {
+		dotenvPath := filepath.Join(cfg.DataDir, ".env")
+		judge := NewLLMJudge(&cfg.Guardrail.Judge, dotenvPath)
+		if judge != nil {
+			router.SetJudge(judge)
+			fmt.Fprintf(os.Stderr, "[sidecar] LLM judge enabled for tool call inspection (model=%s)\n",
+				cfg.Guardrail.Judge.Model)
+		}
+	}
+
 	client.OnEvent = router.Route
 
 	return &Sidecar{
